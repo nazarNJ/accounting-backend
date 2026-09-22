@@ -26,6 +26,12 @@ c.execute('''
     )
 ''')
 
+# إدراج مورد افتراضي تلقائياً إذا كان الجدول فارغاً
+c.execute("SELECT COUNT(*) FROM suppliers")
+if c.fetchone()[0] == 0:
+    c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", ("General / عام", "Germany", "DE000000000"))
+    conn.commit()
+
 c.execute('''
     CREATE TABLE IF NOT EXISTS invoices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +83,6 @@ c.execute('''
     )
 ''')
 
-# تعديل الكمية إلى REAL لدعم الأوزان والأرقام العشرية
 c.execute('''
     CREATE TABLE IF NOT EXISTS inventory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
