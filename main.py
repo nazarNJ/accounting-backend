@@ -214,3 +214,34 @@ def create_inventory_item(item: InventoryItemCreate):
               (item.name, item.sku, item.quantity, item.unit_price))
     conn.commit()
     return {"message": "Inventory item added successfully"}
+@app.get("/invoices/{invoice_id}/erechnung-xml")
+def export_erechnung_xml(invoice_id: int):
+    c.execute("SELECT id, supplier_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount FROM invoices WHERE id=?", (invoice_id,))
+    row = c.fetchone()
+    if not row:
+        return {"error": "Invoice not found"}
+    
+    # هيكل XML قياسي متوافق مع معايير الفوترة الإلكترونية الألمانية (E-Rechnung / ZUGFeRD)
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rsm:CrossIndustryInvoice xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
+                         xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100">
+    <rsm:ExchangedDocument>
+        <ram:ID>{row[2]}</ram:ID>
+        <ram:IssueDateTime>{row[3]}</ram:IssueDateTime>
+    </rsm:ExchangedDocument>
+    <rsm:SupplyChainTradeTransaction>
+        <ram:ApplicableHeaderTradeSettlement>
+            <ram:SpecifiedTradeSettlementMonetarySummation>
+                <ram:LineTotalAmount>{row[4]}</ram:LineTotalAmount>
+                <ram:TaxBasisTotalAmount>{row[4]}</ram:TaxBasisTotalAmount>
+                <ram:TaxTotalAmount>{row[6]}</ram:TaxTotalAmount>
+                <ram:GrandTotalAmount>{row[7]}</ram:GrandTotalAmount>
+            </ram:SpecifiedTradeSettlementMonetarySummation>
+        </ram:ApplicableHeaderTradeSettlement>
+    </rsm:SupplyChainTradeTransaction>
+</rsm:CrossIndustryInvoice>"""
+    return {
+        "invoice_number": row[2], 
+        "standard": "ZUGFeRD / XRechnung (EN 16931)", 
+        "xml_data": xml_content
+    }
