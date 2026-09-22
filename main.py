@@ -43,7 +43,7 @@ c.execute('''
     )
 ''')
 
-# التحديث الآمن لإضافة الأعمدة الجديدة إن لم تكن موجودة
+# التحديث الآمن لإضافة الأعمدة إن لم تكن موجودة
 for col, col_type in [
     ("buyer_name", "TEXT"),
     ("buyer_address", "TEXT"),
@@ -133,20 +133,14 @@ class InvoiceUpdate(BaseModel):
     vat_rate: float
     status: str
 
-class JournalEntryCreate(BaseModel):
-    date: str
-    description: str
-    debit_account_id: int
-    credit_account_id: int
-    amount: float
-
-class ReceiptCreate(BaseModel):
-    date: str
-    vendor: str
-    net_amount: float
-    vat_rate: float
-
 class InventoryItemCreate(BaseModel):
+    supplier_id: int
+    name: str
+    sku: str
+    quantity: int
+    unit_price: float
+
+class InventoryItemUpdate(BaseModel):
     supplier_id: int
     name: str
     sku: str
@@ -310,3 +304,18 @@ def create_inventory_item(item: InventoryItemCreate):
     """, (item.supplier_id, item.name, item.sku, item.quantity, item.unit_price))
     conn.commit()
     return {"message": "Inventory item added successfully"}
+
+@app.put("/inventory/{item_id}")
+def update_inventory_item(item_id: int, item: InventoryItemUpdate):
+    c.execute("""
+        UPDATE inventory SET supplier_id=?, name=?, sku=?, quantity=?, unit_price=?
+        WHERE id=?
+    """, (item.supplier_id, item.name, item.sku, item.quantity, item.unit_price, item_id))
+    conn.commit()
+    return {"message": "Inventory item updated successfully"}
+
+@app.delete("/inventory/{item_id}")
+def delete_inventory_item(item_id: int):
+    c.execute("DELETE FROM inventory WHERE id=?", (item_id,))
+    conn.commit()
+    return {"message": "Inventory item deleted successfully"}
