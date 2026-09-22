@@ -209,3 +209,125 @@ def balance_sheet(db: Session = Depends(get_db)):
         "total_equity": total_equity,
         "is_balanced": abs(total_assets - (total_liabilities + total_equity)) < 0.001
     }
+# أضف هذه الجداول في قاعدة البيانات داخل main.py
+c.execute('''
+    CREATE TABLE IF NOT EXISTS suppliers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        address TEXT,
+        ust_id TEXT
+    )
+''')
+
+c.execute('''
+    CREATE TABLE IF NOT EXISTS invoices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_id INTEGER,
+        invoice_number TEXT NOT NULL,
+        date TEXT NOT NULL,
+        net_amount REAL NOT NULL,
+        vat_rate REAL NOT NULL, -- 0.19 أو 0.07
+        vat_amount REAL NOT NULL,
+        gross_amount REAL NOT NULL,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers (id)
+    )
+''')
+conn.commit()
+
+# أضف هذه الـ Endpoints للـ FastAPI:
+from pydantic import BaseModel
+
+class SupplierCreate(BaseModel):
+    name: str
+    address: str
+    ust_id: str
+
+class InvoiceCreate(BaseModel):
+    supplier_id: int
+    invoice_number: str
+    date: str
+    net_amount: float
+    vat_rate: float # 0.19 أو 0.07
+
+@app.get("/suppliers/")
+def get_suppliers():
+    c.execute("SELECT * FROM suppliers")
+    return [{"id": row[0], "name": row[1], "address": row[2], "ust_id": row[3]} for row in c.fetchall()]
+
+@app.post("/suppliers/")
+def create_supplier(sup: SupplierCreate):
+    c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", 
+              (sup.name, sup.address, sup.ust_id))
+    conn.commit()
+    return {"message": "Supplier created successfully"}
+
+@app.get("/invoices/")
+def get_invoices():
+    c.execute("""
+        SELECT i.id, s.name, i.invoice_number, i.date, i.net_amount, i.vat_rate, i.vat_amount, i.gross_amount 
+        FROM invoices i JOIN suppliers s ON i.supplier_id = s.id
+    """)
+    return [{
+        "id": row[0], "supplier_name": row[1], "invoice_number": row[2], 
+        "date": row[3], "net_amount": row[4], "vat_rate": row[5], 
+        "vat_amount": row[6], "gross_amount": row[7]
+    } for row in c.fetchall()]
+
+@app.post("/invoices/")
+def create_invoice(inv: InvoiceCreate):
+    vat_amount = inv.net_amount * inv.vat_rate
+    gross_amount = inv.net_amount + vat_amount
+    c.execute("""
+        INSERT INTO invoices (supplier_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (inv.supplier_id, inv.invoice_number, inv.date, inv.net_amount, inv.vat_rate, vat_amount, gross_amount))
+    conn.commit()
+    return {"message": "Invoice created successfully", "gross_amount": gross_amount}
+# أضف هذا الجدول في قاعدة البيانات داخل main.py
+c.execute('''
+    CREATE TABLE IF NOT EXISTS journal_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        description TEXT NOT NULL,
+        debit_account_id INTEGER,
+        credit_account_id INTEGER,
+        amount REAL NOT NULL,
+        FOREIGN KEY (debit_account_id) REFERENCES accounts (id),
+        FOREIGN KEY (credit_account_id) REFERENCES accounts (id)
+    )
+''')
+conn.commit()
+
+# أضف نموذج البيانات و الـ Endpoints الخاصة بالقيود:
+class JournalEntryCreate(BaseModel):
+    date: str
+    description: str
+    debit_account_id: int
+    credit_account_id: int
+    amount: float
+
+@app.get("/journal-entries/")
+def get_journal_entries():
+    c.execute("""
+        SELECT j.id, j.date, j.description, d.account_name, cr.account_name, j.amount 
+        FROM journal_entries j
+        JOIN accounts d ON j.debit_account_id = d.id
+        JOIN accounts cr ON j.credit_account_id = cr.id
+    """)
+    return [{
+        "id": row[0], "date": row[1], "description": row[2],
+        "debit_account": row[3], "credit_account": row[4], "amount": row[5]
+    } for row in c.fetchall()]
+
+@app.post("/journal-entries/")
+def create_journal_entry(entry: JournalEntryCreate):
+    c.execute("""
+        INSERT INTO journal_entries (date, description, debit_account_id, credit_account_id, amount)
+        VALUES (?, ?, ?, ?, ?)
+    """, (entry.date, entry.description, entry.debit_account_id, entry.credit_account_id, entry.amount))
+    
+    # تحديث أرصدة الحسابات تلقائياً (مدين يزيد، دائن ينقص)
+    c.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (entry.amount, entry.debit_account_id))
+    c.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (entry.amount, entry.credit_account_id))
+    conn.commit()
+    return {"message": "Journal entry created successfully"}
