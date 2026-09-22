@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 conn = sqlite3.connect('accounting.db', check_same_thread=False)
 c = conn.cursor()
 
-# إنشاء جداول النظام الأساسية
+# إنشاء الجداول الأساسية
 c.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +32,7 @@ if c.fetchone()[0] == 0:
     c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", ("General / عام", "Germany", "DE000000000"))
     conn.commit()
 
-# جدول بيانات الشركة لتعديلها يدوياً
+# جدول إعدادات الشركة (فارغ كلياً بالبداية للإدخال اليدوي)
 c.execute('''
     CREATE TABLE IF NOT EXISTS company_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,21 +55,8 @@ c.execute("SELECT COUNT(*) FROM company_settings")
 if c.fetchone()[0] == 0:
     c.execute('''
         INSERT INTO company_settings (company_name, address, phone, email, website, iban, bic, ust_id, hrb, amtsgericht, director, payment_terms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        "Darnieto GmbH",
-        "Terofalstr. 69, 80689 München",
-        "+49 171 3277770",
-        "N.zehrawi@web.de",
-        "www.darnieto.com",
-        "DE68 7009 1500 0000 3545 03",
-        "GENODEF1DCA",
-        "DE 356285202",
-        "HRB 279740",
-        "München",
-        "Nazira Zehrawi",
-        "Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto."
-    ))
+        VALUES ('', '', '', '', '', '', '', '', '', '', '', '')
+    ''')
     conn.commit()
 
 c.execute('''
@@ -246,7 +233,7 @@ def get_company_settings():
 def update_company_settings(data: CompanySettingsUpdate):
     c.execute("""
         UPDATE company_settings 
-        setItem company_name=?, address=?, phone=?, email=?, website=?, iban=?, bic=?, ust_id=?, hrb=?, amtsgericht=?, director=?, payment_terms=?
+        SET company_name=?, address=?, phone=?, email=?, website=?, iban=?, bic=?, ust_id=?, hrb=?, amtsgericht=?, director=?, payment_terms=?
         WHERE id=1
     """, (
         data.company_name, data.address, data.phone, data.email, data.website,
@@ -380,8 +367,8 @@ def print_invoice_html(invoice_id: int):
     
     c.execute("SELECT company_name, address, phone, email, website, iban, bic, ust_id, hrb, amtsgericht, director, payment_terms FROM company_settings WHERE id=1")
     comp = c.fetchone()
-    comp_name = comp[0] if comp else "Darnieto GmbH"
-    comp_addr = comp[1] if comp else "Terofalstr. 69, 80689 München"
+    comp_name = comp[0] if comp else ""
+    comp_addr = comp[1] if comp else ""
     comp_phone = comp[2] if comp else ""
     comp_email = comp[3] if comp else ""
     comp_web = comp[4] if comp else ""
@@ -391,7 +378,7 @@ def print_invoice_html(invoice_id: int):
     comp_hrb = comp[8] if comp else ""
     comp_amts = comp[9] if comp else ""
     comp_dir = comp[10] if comp else ""
-    comp_terms = comp[11] if comp else "Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto."
+    comp_terms = comp[11] if comp else ""
 
     c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
     items = c.fetchall()
