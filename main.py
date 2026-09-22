@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 conn = sqlite3.connect('accounting.db', check_same_thread=False)
 c = conn.cursor()
 
-# إنشاء الجداول
+# إنشاء الجداول الأساسية
 c.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,7 +26,6 @@ c.execute('''
     )
 ''')
 
-# إدراج مورد افتراضي تلقائياً إذا كان الجدول فارغاً
 c.execute("SELECT COUNT(*) FROM suppliers")
 if c.fetchone()[0] == 0:
     c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", ("General / عام", "Germany", "DE000000000"))
@@ -45,7 +44,21 @@ c.execute('''
         vat_rate REAL NOT NULL,
         vat_amount REAL NOT NULL,
         gross_amount REAL NOT NULL,
-        status TEXT DEFAULT 'Unpaid'
+        status TEXT DEFAULT 'Unpaid',
+        payment_method TEXT DEFAULT 'Bank'
+    )
+''')
+
+# جدول تفاصيل منتجات الفاتورة (لإضافة أكثر من منتج للفاتورة الواحدة)
+c.execute('''
+    CREATE TABLE IF NOT EXISTS invoice_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER,
+        inventory_item_id INTEGER,
+        item_name TEXT,
+        quantity REAL,
+        unit_price REAL,
+        net_total REAL
     )
 ''')
 
@@ -53,7 +66,8 @@ for col, col_type in [
     ("buyer_name", "TEXT"),
     ("buyer_address", "TEXT"),
     ("buyer_ust_id", "TEXT"),
-    ("status", "TEXT DEFAULT 'Unpaid'")
+    ("status", "TEXT DEFAULT 'Unpaid'"),
+    ("payment_method", "TEXT DEFAULT 'Bank'")
 ]:
     try:
         c.execute(f"ALTER TABLE invoices ADD COLUMN {col} {col_type}")
@@ -116,36 +130,20 @@ class SupplierCreate(BaseModel):
     address: str
     ust_id: str
 
-class InvoiceCreate(BaseModel):
-    supplier_id: int = 1
-    buyer_name: str
-    buyer_address: str
-    buyer_ust_id: str = ""
-    invoice_number: str
-    date: str
-    net_amount: float
-    vat_rate: float
-    status: str = "Unpaid"
-
-class InvoiceUpdate(BaseModel):
-    supplier_id: int = 1
-    buyer_name: str
-    buyer_address: str
-    buyer_ust_id: str = ""
-    invoice_number: str
-    date: str
-    net_amount: float
-    vat_rate: float
-    status: str
-
-class InvoiceFromInventoryCreate(BaseModel):
-    supplier_id: int
+class CartItem(BaseModel):
     inventory_item_id: int
     quantity: float
+
+class MultiItemInvoiceCreate(BaseModel):
+    buyer_name: str
+    buyer_address: str
+    buyer_ust_id: str = ""
     invoice_number: str
     date: str
     vat_rate: float
     status: str = "Unpaid"
+    payment_method: str = "Bank"
+    items: list[CartItem]
 
 class InventoryItemCreate(BaseModel):
     supplier_id: int
@@ -204,97 +202,122 @@ def create_supplier(sup: SupplierCreate):
 
 @app.get("/invoices/")
 def get_invoices():
-    c.execute("SELECT id, supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status FROM invoices")
-    return [{
-        "id": r[0], "supplier_id": r[1], "buyer_name": r[2], "buyer_address": r[3], "buyer_ust_id": r[4],
-        "invoice_number": r[5], "date": r[6], "net_amount": r[7], "vat_rate": r[8], "vat_amount": r[9], "gross_amount": r[10], "status": r[11]
-    } for r in c.fetchall()]
+    c.execute("SELECT id, supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method FROM invoices")
+    invoices = []
+    for r in c.fetchall():
+        inv_id = r[0]
+        c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (inv_id,))
+        items = [{"name": i[0], "quantity": i[1], "unit_price": i[2], "net_total": i[3]} for i in c.fetchall()]
+        invoices.append({
+            "id": inv_id, "supplier_id": r[1], "buyer_name": r[2], "buyer_address": r[3], "buyer_ust_id": r[4],
+            "invoice_number": r[5], "date": r[6], "net_amount": r[7], "vat_rate": r[8], "vat_amount": r[9], 
+            "gross_amount": r[10], "status": r[11], "payment_method": r[12], "items": items
+        })
+    return invoices
 
-@app.post("/invoices/")
-def create_invoice(inv: InvoiceCreate):
-    vat_amount = inv.net_amount * inv.vat_rate
-    gross_amount = inv.net_amount + vat_amount
+@app.post("/invoices/multi-item/")
+def create_multi_item_invoice(data: MultiItemInvoiceCreate):
+    if not data.items:
+        return {"error": "No items selected for invoice"}
+    
+    total_net = 0.0
+    processed_items = []
+    
+    for cart_item in data.items:
+        c.execute("SELECT name, quantity, unit_price, supplier_id FROM inventory WHERE id=?", (cart_item.inventory_item_id,))
+        inv_row = c.fetchone()
+        if not inv_row:
+            return {"error": f"Inventory item ID {cart_item.inventory_item_id} not found"}
+        
+        name, stock_qty, unit_price, sup_id = inv_row
+        if stock_qty < cart_item.quantity:
+            return {"error": f"Not enough stock for {name}. Available: {stock_qty}"}
+        
+        item_net = unit_price * cart_item.quantity
+        total_net += item_net
+        processed_items.append({
+            "id": cart_item.inventory_item_id,
+            "name": name,
+            "quantity": cart_item.quantity,
+            "unit_price": unit_price,
+            "net_total": item_net,
+            "supplier_id": sup_id or 1
+        })
+    
+    vat_amount = total_net * data.vat_rate
+    gross_amount = total_net + vat_amount
+    first_supplier_id = processed_items[0]["supplier_id"] if processed_items else 1
+    
+    # إدخال الفاتورة الرئيسية
     c.execute("""
-        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (inv.supplier_id, inv.buyer_name, inv.buyer_address, inv.buyer_ust_id, inv.invoice_number, inv.date, inv.net_amount, inv.vat_rate, vat_amount, gross_amount, inv.status))
+        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (first_supplier_id, data.buyer_name, data.buyer_address, data.buyer_ust_id, data.invoice_number, data.date, total_net, data.vat_rate, vat_amount, gross_amount, data.status, data.payment_method))
+    
+    invoice_id = c.lastrowid
+    
+    # إدخال العناصر وخصم المخزون
+    for p in processed_items:
+        c.execute("""
+            INSERT INTO invoice_items (invoice_id, inventory_item_id, item_name, quantity, unit_price, net_total)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (invoice_id, p["id"], p["name"], p["quantity"], p["unit_price"], p["net_total"]))
+        
+        new_qty = c.execute("SELECT quantity FROM inventory WHERE id=?", (p["id"],)).fetchone()[0] - p["quantity"]
+        c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, p["id"]))
+    
     conn.commit()
-    return {"message": "German § 14 Invoice created successfully"}
-
-@app.put("/invoices/{invoice_id}")
-def update_invoice(invoice_id: int, inv: InvoiceUpdate):
-    vat_amount = inv.net_amount * inv.vat_rate
-    gross_amount = inv.net_amount + vat_amount
-    c.execute("""
-        UPDATE invoices SET supplier_id=?, buyer_name=?, buyer_address=?, buyer_ust_id=?, invoice_number=?, date=?, net_amount=?, vat_rate=?, vat_amount=?, gross_amount=?, status=?
-        WHERE id=?
-    """, (inv.supplier_id, inv.buyer_name, inv.buyer_address, inv.buyer_ust_id, inv.invoice_number, inv.date, inv.net_amount, inv.vat_rate, vat_amount, gross_amount, inv.status, invoice_id))
-    conn.commit()
-    return {"message": "Invoice updated successfully"}
-
-@app.post("/invoices/from-inventory/")
-def create_invoice_from_inventory(data: InvoiceFromInventoryCreate):
-    c.execute("SELECT name, quantity, unit_price FROM inventory WHERE id=?", (data.inventory_item_id,))
-    item = c.fetchone()
-    if not item:
-        return {"error": "Inventory item not found"}
-    
-    item_name, stock_qty, unit_price = item
-    if stock_qty < data.quantity:
-        return {"error": "Not enough stock available"}
-    
-    net_amount = unit_price * data.quantity
-    vat_amount = net_amount * data.vat_rate
-    gross_amount = net_amount + vat_amount
-    
-    c.execute("""
-        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (data.supplier_id, "Standard Buyer", "Germany", "", data.invoice_number, data.date, net_amount, data.vat_rate, vat_amount, gross_amount, data.status))
-    
-    new_qty = stock_qty - data.quantity
-    c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, data.inventory_item_id))
-    conn.commit()
-    
-    return {"message": "Invoice created from inventory and stock updated successfully"}
+    return {"message": "Multi-item invoice created successfully and stock updated!"}
 
 @app.get("/invoices/{invoice_id}/erechnung-xml")
 def export_erechnung_xml(invoice_id: int):
-    c.execute("SELECT id, supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status FROM invoices WHERE id=?", (invoice_id,))
+    c.execute("SELECT id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method FROM invoices WHERE id=?", (invoice_id,))
     row = c.fetchone()
     if not row:
         return {"error": "Invoice not found"}
     
+    c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
+    items_xml = "".join([f"""
+        <ram:IncludedSupplyChainTradeLineItem>
+            <ram:SpecifiedTradeProduct><ram:Name>{i[0]}</ram:Name></ram:SpecifiedTradeProduct>
+            <ram:SpecifiedLineTradeDelivery><ram:BilledQuantity>{i[1]}</ram:BilledQuantity></ram:SpecifiedLineTradeDelivery>
+            <ram:SpecifiedLineTradeSettlement>
+                <ram:SpecifiedTradeSettlementMonetarySummation><ram:LineTotalAmount>{i[3]}</ram:LineTotalAmount></ram:SpecifiedTradeSettlementMonetarySummation>
+            </ram:SpecifiedLineTradeSettlement>
+        </ram:IncludedSupplyChainTradeLineItem>""" for i in c.fetchall()])
+
     xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rsm:CrossIndustryInvoice xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
                          xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100">
     <rsm:ExchangedDocument>
-        <ram:ID>{row[5]}</ram:ID>
-        <ram:IssueDateTime>{row[6]}</ram:IssueDateTime>
+        <ram:ID>{row[4]}</ram:ID>
+        <ram:IssueDateTime>{row[5]}</ram:IssueDateTime>
     </rsm:ExchangedDocument>
     <rsm:SupplyChainTradeTransaction>
         <ram:ApplicableHeaderTradeAgreement>
             <ram:BuyerTradeParty>
-                <ram:Name>{row[2]}</ram:Name>
-                <ram:PostalTradeAddress><ram:LineOne>{row[3]}</ram:LineOne></ram:PostalTradeAddress>
-                <ram:SpecifiedTaxRegistration><ram:ID>{row[4]}</ram:ID></ram:SpecifiedTaxRegistration>
+                <ram:Name>{row[1]}</ram:Name>
+                <ram:PostalTradeAddress><ram:LineOne>{row[2]}</ram:LineOne></ram:PostalTradeAddress>
+                <ram:SpecifiedTaxRegistration><ram:ID>{row[3]}</ram:ID></ram:SpecifiedTaxRegistration>
             </ram:BuyerTradeParty>
         </ram:ApplicableHeaderTradeAgreement>
+        {items_xml}
         <ram:ApplicableHeaderTradeSettlement>
+            <ram:PaymentMeans><ram:TypeCode>{'42' if row[11]=='Bank' else '10'}</ram:TypeCode></ram:PaymentMeans>
             <ram:SpecifiedTradeSettlementMonetarySummation>
-                <ram:LineTotalAmount>{row[7]}</ram:LineTotalAmount>
-                <ram:TaxBasisTotalAmount>{row[7]}</ram:TaxBasisTotalAmount>
-                <ram:TaxTotalAmount>{row[9]}</ram:TaxTotalAmount>
-                <ram:GrandTotalAmount>{row[10]}</ram:GrandTotalAmount>
+                <ram:LineTotalAmount>{row[6]}</ram:LineTotalAmount>
+                <ram:TaxBasisTotalAmount>{row[6]}</ram:TaxBasisTotalAmount>
+                <ram:TaxTotalAmount>{row[8]}</ram:TaxTotalAmount>
+                <ram:GrandTotalAmount>{row[9]}</ram:GrandTotalAmount>
             </ram:SpecifiedTradeSettlementMonetarySummation>
         </ram:ApplicableHeaderTradeSettlement>
     </rsm:SupplyChainTradeTransaction>
 </rsm:CrossIndustryInvoice>"""
     return {
-        "invoice_number": row[5], 
-        "buyer": row[2],
+        "invoice_number": row[4], 
+        "buyer": row[1],
+        "payment_method": row[11],
         "standard": "ZUGFeRD / XRechnung (EN 16931)", 
-        "status": row[11],
         "xml_data": xml_content
     }
 
