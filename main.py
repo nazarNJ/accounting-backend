@@ -245,3 +245,80 @@ def export_erechnung_xml(invoice_id: int):
         "standard": "ZUGFeRD / XRechnung (EN 16931)", 
         "xml_data": xml_content
     }
+class InvoiceFromInventoryCreate(BaseModel):
+    supplier_id: int
+    inventory_item_id: int
+    quantity: int
+    invoice_number: str
+    date: str
+    vat_rate: float
+
+@app.post("/invoices/from-inventory/")
+def create_invoice_from_inventory(data: InvoiceFromInventoryCreate):
+    # 1. جلب بيانات الصنف من المخزن
+    c.execute("SELECT name, quantity, unit_price FROM inventory WHERE id=?", (data.inventory_item_id,))
+    item = c.fetchone()
+    if not item:
+        return {"error": "Inventory item not found"}
+    
+    item_name, stock_qty, unit_price = item
+    if stock_qty < data.quantity:
+        return {"error": "Not enough stock available"}
+    
+    # 2. حساب القيم المالية
+    net_amount = unit_price * data.quantity
+    vat_amount = net_amount * data.vat_rate
+    gross_amount = net_amount + vat_amount
+    
+    # 3. حفظ الفاتورة
+    c.execute("""
+        INSERT INTO invoices (supplier_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (data.supplier_id, data.invoice_number, data.date, net_amount, data.vat_rate, vat_amount, gross_amount))
+    
+    # 4. خصم الكمية المباعة من المخزون تلقائياً
+    new_qty = stock_qty - data.quantity
+    c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, data.inventory_item_id))
+    conn.commit()
+    
+    return {"message": "Invoice created from inventory and stock updated successfully"}
+# تحديث جدول المخزون ليشمل معرف المورد
+c.execute('''
+    CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_id INTEGER,
+        name TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL
+    )
+''')
+conn.commit()
+
+class InventoryItemCreate(BaseModel):
+    supplier_id: int
+    name: str
+    sku: str
+    quantity: int
+    unit_price: float
+
+@app.get("/inventory/")
+def get_inventory():
+    c.execute("""
+        SELECT inv.id, inv.supplier_id, inv.name, inv.sku, inv.quantity, inv.unit_price, sup.name 
+        FROM inventory inv 
+        LEFT JOIN suppliers sup ON inv.supplier_id = sup.id
+    """)
+    return [{
+        "id": r[0], "supplier_id": r[1], "name": r[2], "sku": r[3], 
+        "quantity": r[4], "unit_price": r[5], "supplier_name": r[6] or "General"
+    } for r in c.fetchall()]
+
+@app.post("/inventory/")
+def create_inventory_item(item: InventoryItemCreate):
+    c.execute("""
+        INSERT INTO inventory (supplier_id, name, sku, quantity, unit_price)
+        VALUES (?, ?, ?, ?, ?)
+    """, (item.supplier_id, item.name, item.sku, item.quantity, item.unit_price))
+    conn.commit()
+    return {"message": "Inventory item added successfully"}
