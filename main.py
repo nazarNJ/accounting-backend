@@ -331,3 +331,37 @@ def create_journal_entry(entry: JournalEntryCreate):
     c.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (entry.amount, entry.credit_account_id))
     conn.commit()
     return {"message": "Journal entry created successfully"}
+# أضف هذا الجدول في قاعدة البيانات داخل main.py
+c.execute('''
+    CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL
+    )
+''')
+conn.commit()
+
+class InventoryItemCreate(BaseModel):
+    name: str
+    sku: str
+    quantity: int
+    unit_price: float
+
+@app.get("/inventory/")
+def get_inventory():
+    c.execute("SELECT id, name, sku, quantity, unit_price FROM inventory")
+    return [{
+        "id": row[0], "name": row[1], "sku": row[2],
+        "quantity": row[3], "unit_price": row[4]
+    } for row in c.fetchall()]
+
+@app.post("/inventory/")
+def create_inventory_item(item: InventoryItemCreate):
+    c.execute("""
+        INSERT INTO inventory (name, sku, quantity, unit_price)
+        VALUES (?, ?, ?, ?)
+    """, (item.name, item.sku, item.quantity, item.unit_price))
+    conn.commit()
+    return {"message": "Inventory item added successfully"}
