@@ -145,6 +145,19 @@ class MultiItemInvoiceCreate(BaseModel):
     payment_method: str = "Bank"
     items: list[CartItem]
 
+class JournalEntryCreate(BaseModel):
+    date: str
+    description: str
+    debit_account_id: int
+    credit_account_id: int
+    amount: float
+
+class ReceiptCreate(BaseModel):
+    date: str
+    vendor: str
+    net_amount: float
+    vat_rate: float = 0.19
+
 class InventoryItemCreate(BaseModel):
     supplier_id: int
     name: str
@@ -273,6 +286,7 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (invoice_id, p["id"], p["name"], p["quantity"], p["unit_price"], p["net_total"]))
         
+        # خصم الكمية فقط دون حذف الصنف نهائياً من الجدول
         new_qty = c.execute("SELECT quantity FROM inventory WHERE id=?", (p["id"],)).fetchone()[0] - p["quantity"]
         c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, p["id"]))
     
@@ -289,11 +303,9 @@ def print_invoice_html(invoice_id: int):
     c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
     items = c.fetchall()
     
-    items_html = "".join([f"<tr><td>{i[0]}</td><td style='text-align:center;'>{i[1]}</td><td style='text-align:right;'>{i[2]:.2f} €</td><td style='text-align:right;'>{i[3]:.2f} €</td></tr>" for i in items])
+    items_html = "".join([f"<tr><td style='text-align:center;'>{idx+1}</td><td>{i[0]}</td><td style='text-align:center;'>{i[1]}</td><td style='text-align:center;'>Karton</td><td style='text-align:right;'>{i[2]:.2f} €</td><td style='text-align:right;'>{i[3]:.2f} €</td></tr>" for idx, i in enumerate(items)])
     vat_percent = int(inv[7] * 100)
-    status_text = "Bezahlt (Paid)" if inv[10] == "Paid" else "Unbezahlt (Unpaid)"
-    status_color = "#22c55e" if inv[10] == "Paid" else "#ef4444"
-    pay_method = "Überweisung (Bank Transfer)" if inv[11] == "Bank" else "Barzahlung (Cash)"
+    pay_method = "Überweisung" if inv[11] == "Bank" else "Barzahlung"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -302,61 +314,67 @@ def print_invoice_html(invoice_id: int):
         <meta charset="UTF-8">
         <title>Rechnung Nr. {inv[4]}</title>
         <style>
-            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 40px; color: #1e293b; background: #fff; }}
-            .container {{ max-width: 800px; margin: auto; border: 1px solid #cbd5e1; padding: 40px; border-radius: 8px; }}
-            .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #0284c7; padding-bottom: 20px; margin-bottom: 30px; }}
-            .company-info {{ font-size: 14px; color: #475569; }}
-            .invoice-title {{ text-align: right; }}
-            .invoice-title h1 {{ color: #0284c7; margin: 0 0 10px 0; }}
-            .details-section {{ display: flex; justify-content: space-between; margin-bottom: 30px; font-size: 14px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
-            th, td {{ border: 1px solid #e2e8f0; padding: 12px; font-size: 14px; }}
-            th {{ background-color: #f1f5f9; color: #0f172a; text-align: left; }}
-            .totals {{ width: 350px; margin-left: auto; }}
-            .totals td {{ padding: 8px 12px; }}
-            .status-badge {{ display: inline-block; padding: 6px 12px; border-radius: 6px; color: #fff; background-color: {status_color}; font-weight: bold; }}
-            .footer {{ margin-top: 50px; font-size: 12px; color: #64748b; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; }}
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 30px; color: #1e293b; background: #fff; font-size: 13px; }}
+            .container {{ max-width: 800px; margin: auto; border: 1px solid #cbd5e1; padding: 40px; border-radius: 6px; position: relative; min-height: 1050px; box-sizing: border-box; }}
+            .top-header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 40px; }}
+            .logo-area {{ background: #dc2626; color: white; padding: 10px 20px; font-weight: bold; font-size: 20px; border-radius: 4px; display: inline-block; font-style: italic; }}
+            .invoice-meta {{ text-align: right; font-size: 13px; line-height: 1.6; }}
+            .invoice-meta table {{ width: auto; margin-left: auto; border: none; }}
+            .invoice-meta td {{ border: none; padding: 2px 8px; }}
+            .addresses {{ display: flex; justify-content: space-between; margin-bottom: 30px; font-size: 13px; line-height: 1.5; }}
+            .sender-line {{ font-size: 10px; text-decoration: underline; color: #475569; margin-bottom: 10px; }}
+            table.items-table {{ width: 100%; border-collapse: collapse; margin-bottom: 25px; }}
+            table.items-table th, table.items-table td {{ border: 1px solid #94a3b8; padding: 8px 10px; font-size: 13px; }}
+            table.items-table th {{ background-color: #f1f5f9; color: #0f172a; text-align: left; font-weight: bold; }}
+            .totals-table {{ width: 350px; margin-left: auto; border-collapse: collapse; margin-bottom: 30px; }}
+            .totals-table td {{ border: 1px solid #94a3b8; padding: 6px 10px; }}
+            .payment-terms {{ font-size: 12px; line-height: 1.5; margin-bottom: 30px; color: #334155; }}
+            .qr-section {{ display: flex; align-items: center; gap: 15px; margin-bottom: 40px; }}
+            .qr-box {{ border: 1px solid #cbd5e1; padding: 10px; width: 80px; height: 80px; text-align: center; font-size: 10px; background: #f8fafc; }}
+            .footer {{ position: absolute; bottom: 30px; left: 40px; right: 40px; display: flex; justify-content: space-between; font-size: 10px; color: #475569; border-top: 1px solid #cbd5e1; padding-top: 15px; line-height: 1.4; }}
+            .footer div {{ flex: 1; }}
         </style>
     </head>
     <body onload="window.print()">
         <div class="container">
-            <div class="header">
-                <div class="company-info">
-                    <h2>Ihr ERP Unternehmen GmbH</h2>
-                    <p>Musterstraße 42<br>10115 Berlin, Deutschland<br>St.-Nr: 30/123/45678<br>USt-IdNr: DE987654321</p>
+            <div class="top-header">
+                <div>
+                    <div class="logo-area">Darnieto</div>
                 </div>
-                <div class="invoice-title">
-                    <h1>RECHNUNG</h1>
-                    <p><strong>Rechnungsnummer:</strong> {inv[4]}<br>
-                       <strong>Datum:</strong> {inv[5]}<br>
-                       <strong>Zahlungsart:</strong> {pay_method}</p>
+                <div class="invoice-meta">
+                    <h2 style="margin: 0 0 10px 0; font-size: 22px;">Rechnung</h2>
+                    <table>
+                        <tr><td>Rechnungsnr.:</td><td><strong>{inv[4]}</strong></td></tr>
+                        <tr><td>Kundennr.:</td><td>10168</td></tr>
+                        <tr><td>Datum:</td><td>{inv[5]}</td></tr>
+                        <tr><td>Lieferdatum:</td><td>{inv[5]}</td></tr>
+                    </table>
                 </div>
             </div>
 
-            <div class="details-section">
+            <div class="sender-line">Darnieto GmbH, Terofalstr. 69, 80689 München</div>
+
+            <div class="addresses">
                 <div>
-                    <strong>Rechnungsempfänger (Käufer):</strong><br>
-                    <div style="margin-top: 5px; font-size: 15px;">
-                        <strong>{inv[1]}</strong><br>
-                        {inv[2]}<br>
-                        {('USt-IdNr: ' + inv[3]) if inv[3] else ''}
-                    </div>
+                    <strong>{inv[1]}</strong><br>
+                    {inv[2]}
                 </div>
-                <div>
-                    <strong>Status:</strong><br>
-                    <div style="margin-top: 5px;">
-                        <span class="status-badge">{status_text}</span>
-                    </div>
+                <div style="text-align: right; font-size: 12px;">
+                    Darnieto GmbH<br>
+                    Terofalstr. 69<br>
+                    80689 München
                 </div>
             </div>
 
-            <table>
+            <table class="items-table">
                 <thead>
                     <tr>
-                        <th>Artikelbezeichnung</th>
-                        <th style="text-align:center;">Menge / Gewicht</th>
-                        <th style="text-align:right;">Einzelpreis (Netto)</th>
-                        <th style="text-align:right;">Gesamt (Netto)</th>
+                        <th style="width: 40px; text-align: center;">Pos.</th>
+                        <th>Bezeichnung</th>
+                        <th style="width: 60px; text-align: center;">Menge</th>
+                        <th style="width: 70px; text-align: center;">Einheit</th>
+                        <th style="width: 90px; text-align: right;">Einzel €</th>
+                        <th style="width: 90px; text-align: right;">Gesamt €</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -364,24 +382,71 @@ def print_invoice_html(invoice_id: int):
                 </tbody>
             </table>
 
-            <table class="totals">
+            <table class="totals-table">
                 <tr>
-                    <td><strong>Nettobetrag:</strong></td>
-                    <td style="text-align:right;">{inv[6]:.2f} €</td>
+                    <td>Zwischensumme (netto)</td>
+                    <td style="text-align: right;">{inv[6]:.2f} €</td>
                 </tr>
                 <tr>
-                    <td><strong>Umsatzsteuer ({vat_percent}%):</strong></td>
-                    <td style="text-align:right;">{inv[8]:.2f} €</td>
+                    <td>abzgl. Rabatt</td>
+                    <td style="text-align: right;">0,00 €</td>
                 </tr>
-                <tr style="border-top: 2px solid #0f172a; font-size: 16px;">
-                    <td><strong>Gesamtbetrag (Brutto):</strong></td>
-                    <td style="text-align:right;"><strong>{inv[9]:.2f} €</strong></td>
+                <tr>
+                    <td><strong>Gesamt (netto)</strong></td>
+                    <td style="text-align: right;"><strong>{inv[6]:.2f} €</strong></td>
+                </tr>
+                <tr>
+                    <td>Umsatzsteuer {vat_percent} %</td>
+                    <td style="text-align: right;">{inv[8]:.2f} €</td>
+                </tr>
+                <tr style="background-color: #f1f5f9; font-size: 14px;">
+                    <td><strong>Gesamtbetrag</strong></td>
+                    <td style="text-align: right;"><strong>{inv[9]:.2f} €</strong></td>
                 </tr>
             </table>
 
+            <div class="payment-terms">
+                Zahlungsart: {pay_method}<br>
+                Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto.<br><br>
+                Nach Ablauf dieser Frist gerät der Kunde ohne weitere Mahnung in Verzug.<br>
+                Es werden gesetzliche Verzugszinsen sowie Mahngebühren erhoben.<br>
+                Für weitere Fragen stehen wir Ihnen gerne zur Verfügung.
+            </div>
+
+            <div class="qr-section">
+                <div class="qr-box">
+                    [ QR Code ]
+                </div>
+                <div style="font-size: 11px;">
+                    <strong>Überweisen per Code</strong><br>
+                    Ganz bequem Code mit der<br>Banking-App scannen.
+                </div>
+            </div>
+
             <div class="footer">
-                <p>Vielen Dank für Ihren Geschäftsauftrag! Gemäß § 14 UStG ist diese Rechnung ohne Unterschrift gültig.</p>
-                <p>Bankverbindung: Musterbank Berlin | IBAN: DE89 3704 0044 0532 0130 00 | BIC: GENODEM1XXX</p>
+                <div>
+                    Darnieto GmbH<br>
+                    Terofalstr. 69<br>
+                    80689 München<br>
+                    🌐 www.darnieto.com
+                </div>
+                <div>
+                    📞 +49 171 3277770<br>
+                    📠 +49 171 3277771<br>
+                    ✉️ N.zehrawi@web.de
+                </div>
+                <div>
+                    Bankverbindung:<br>
+                    Volksbank Raiffeisenbank eG Dachau<br>
+                    IBAN: DE68 7009 1500 0000 3545 03<br>
+                    BIC: GENODEF1DCA
+                </div>
+                <div>
+                    UST.-ID: DE 356285202<br>
+                    HRB 279740<br>
+                    Amtsgericht: München<br>
+                    Geschäftsführer: Nazira Zehrawi
+                </div>
             </div>
         </div>
     </body>
