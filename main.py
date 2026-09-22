@@ -43,7 +43,6 @@ c.execute('''
     )
 ''')
 
-# التحديث الآمن لإضافة الأعمدة إن لم تكن موجودة
 for col, col_type in [
     ("buyer_name", "TEXT"),
     ("buyer_address", "TEXT"),
@@ -78,13 +77,14 @@ c.execute('''
     )
 ''')
 
+# تعديل الكمية إلى REAL لدعم الأوزان والأرقام العشرية
 c.execute('''
     CREATE TABLE IF NOT EXISTS inventory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         supplier_id INTEGER,
         name TEXT NOT NULL,
         sku TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
+        quantity REAL NOT NULL,
         unit_price REAL NOT NULL
     )
 ''')
@@ -133,18 +133,27 @@ class InvoiceUpdate(BaseModel):
     vat_rate: float
     status: str
 
+class InvoiceFromInventoryCreate(BaseModel):
+    supplier_id: int
+    inventory_item_id: int
+    quantity: float
+    invoice_number: str
+    date: str
+    vat_rate: float
+    status: str = "Unpaid"
+
 class InventoryItemCreate(BaseModel):
     supplier_id: int
     name: str
     sku: str
-    quantity: int
+    quantity: float
     unit_price: float
 
 class InventoryItemUpdate(BaseModel):
     supplier_id: int
     name: str
     sku: str
-    quantity: int
+    quantity: float
     unit_price: float
 
 @app.get("/")
@@ -217,6 +226,32 @@ def update_invoice(invoice_id: int, inv: InvoiceUpdate):
     """, (inv.supplier_id, inv.buyer_name, inv.buyer_address, inv.buyer_ust_id, inv.invoice_number, inv.date, inv.net_amount, inv.vat_rate, vat_amount, gross_amount, inv.status, invoice_id))
     conn.commit()
     return {"message": "Invoice updated successfully"}
+
+@app.post("/invoices/from-inventory/")
+def create_invoice_from_inventory(data: InvoiceFromInventoryCreate):
+    c.execute("SELECT name, quantity, unit_price FROM inventory WHERE id=?", (data.inventory_item_id,))
+    item = c.fetchone()
+    if not item:
+        return {"error": "Inventory item not found"}
+    
+    item_name, stock_qty, unit_price = item
+    if stock_qty < data.quantity:
+        return {"error": "Not enough stock available"}
+    
+    net_amount = unit_price * data.quantity
+    vat_amount = net_amount * data.vat_rate
+    gross_amount = net_amount + vat_amount
+    
+    c.execute("""
+        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (data.supplier_id, "Standard Buyer", "Germany", "", data.invoice_number, data.date, net_amount, data.vat_rate, vat_amount, gross_amount, data.status))
+    
+    new_qty = stock_qty - data.quantity
+    c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, data.inventory_item_id))
+    conn.commit()
+    
+    return {"message": "Invoice created from inventory and stock updated successfully"}
 
 @app.get("/invoices/{invoice_id}/erechnung-xml")
 def export_erechnung_xml(invoice_id: int):
