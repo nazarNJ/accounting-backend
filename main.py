@@ -1,5 +1,6 @@
 import sqlite3
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -49,7 +50,6 @@ c.execute('''
     )
 ''')
 
-# جدول تفاصيل منتجات الفاتورة (لإضافة أكثر من منتج للفاتورة الواحدة)
 c.execute('''
     CREATE TABLE IF NOT EXISTS invoice_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,6 +215,18 @@ def get_invoices():
         })
     return invoices
 
+@app.patch("/invoices/{invoice_id}/toggle-status")
+def toggle_invoice_status(invoice_id: int):
+    c.execute("SELECT status FROM invoices WHERE id=?", (invoice_id,))
+    row = c.fetchone()
+    if not row:
+        return {"error": "Invoice not found"}
+    current_status = row[0]
+    new_status = "Unpaid" if current_status == "Paid" else "Paid"
+    c.execute("UPDATE invoices SET status=? WHERE id=?", (new_status, invoice_id))
+    conn.commit()
+    return {"message": "Status toggled successfully", "status": new_status}
+
 @app.post("/invoices/multi-item/")
 def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     if not data.items:
@@ -248,7 +260,6 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     gross_amount = total_net + vat_amount
     first_supplier_id = processed_items[0]["supplier_id"] if processed_items else 1
     
-    # إدخال الفاتورة الرئيسية
     c.execute("""
         INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -256,7 +267,6 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     
     invoice_id = c.lastrowid
     
-    # إدخال العناصر وخصم المخزون
     for p in processed_items:
         c.execute("""
             INSERT INTO invoice_items (invoice_id, inventory_item_id, item_name, quantity, unit_price, net_total)
@@ -269,57 +279,115 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     conn.commit()
     return {"message": "Multi-item invoice created successfully and stock updated!"}
 
-@app.get("/invoices/{invoice_id}/erechnung-xml")
-def export_erechnung_xml(invoice_id: int):
+@app.get("/invoices/{invoice_id}/print-html", response_class=HTMLResponse)
+def print_invoice_html(invoice_id: int):
     c.execute("SELECT id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method FROM invoices WHERE id=?", (invoice_id,))
-    row = c.fetchone()
-    if not row:
-        return {"error": "Invoice not found"}
+    inv = c.fetchone()
+    if not inv:
+        return "<h1>Invoice not found</h1>", 404
     
     c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
-    items_xml = "".join([f"""
-        <ram:IncludedSupplyChainTradeLineItem>
-            <ram:SpecifiedTradeProduct><ram:Name>{i[0]}</ram:Name></ram:SpecifiedTradeProduct>
-            <ram:SpecifiedLineTradeDelivery><ram:BilledQuantity>{i[1]}</ram:BilledQuantity></ram:SpecifiedLineTradeDelivery>
-            <ram:SpecifiedLineTradeSettlement>
-                <ram:SpecifiedTradeSettlementMonetarySummation><ram:LineTotalAmount>{i[3]}</ram:LineTotalAmount></ram:SpecifiedTradeSettlementMonetarySummation>
-            </ram:SpecifiedLineTradeSettlement>
-        </ram:IncludedSupplyChainTradeLineItem>""" for i in c.fetchall()])
+    items = c.fetchall()
+    
+    items_html = "".join([f"<tr><td>{i[0]}</td><td style='text-align:center;'>{i[1]}</td><td style='text-align:right;'>{i[2]:.2f} €</td><td style='text-align:right;'>{i[3]:.2f} €</td></tr>" for i in items])
+    vat_percent = int(inv[7] * 100)
+    status_text = "Bezahlt (Paid)" if inv[10] == "Paid" else "Unbezahlt (Unpaid)"
+    status_color = "#22c55e" if inv[10] == "Paid" else "#ef4444"
+    pay_method = "Überweisung (Bank Transfer)" if inv[11] == "Bank" else "Barzahlung (Cash)"
 
-    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rsm:CrossIndustryInvoice xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
-                         xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100">
-    <rsm:ExchangedDocument>
-        <ram:ID>{row[4]}</ram:ID>
-        <ram:IssueDateTime>{row[5]}</ram:IssueDateTime>
-    </rsm:ExchangedDocument>
-    <rsm:SupplyChainTradeTransaction>
-        <ram:ApplicableHeaderTradeAgreement>
-            <ram:BuyerTradeParty>
-                <ram:Name>{row[1]}</ram:Name>
-                <ram:PostalTradeAddress><ram:LineOne>{row[2]}</ram:LineOne></ram:PostalTradeAddress>
-                <ram:SpecifiedTaxRegistration><ram:ID>{row[3]}</ram:ID></ram:SpecifiedTaxRegistration>
-            </ram:BuyerTradeParty>
-        </ram:ApplicableHeaderTradeAgreement>
-        {items_xml}
-        <ram:ApplicableHeaderTradeSettlement>
-            <ram:PaymentMeans><ram:TypeCode>{'42' if row[11]=='Bank' else '10'}</ram:TypeCode></ram:PaymentMeans>
-            <ram:SpecifiedTradeSettlementMonetarySummation>
-                <ram:LineTotalAmount>{row[6]}</ram:LineTotalAmount>
-                <ram:TaxBasisTotalAmount>{row[6]}</ram:TaxBasisTotalAmount>
-                <ram:TaxTotalAmount>{row[8]}</ram:TaxTotalAmount>
-                <ram:GrandTotalAmount>{row[9]}</ram:GrandTotalAmount>
-            </ram:SpecifiedTradeSettlementMonetarySummation>
-        </ram:ApplicableHeaderTradeSettlement>
-    </rsm:SupplyChainTradeTransaction>
-</rsm:CrossIndustryInvoice>"""
-    return {
-        "invoice_number": row[4], 
-        "buyer": row[1],
-        "payment_method": row[11],
-        "standard": "ZUGFeRD / XRechnung (EN 16931)", 
-        "xml_data": xml_content
-    }
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <title>Rechnung Nr. {inv[4]}</title>
+        <style>
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 40px; color: #1e293b; background: #fff; }}
+            .container {{ max-width: 800px; margin: auto; border: 1px solid #cbd5e1; padding: 40px; border-radius: 8px; }}
+            .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #0284c7; padding-bottom: 20px; margin-bottom: 30px; }}
+            .company-info {{ font-size: 14px; color: #475569; }}
+            .invoice-title {{ text-align: right; }}
+            .invoice-title h1 {{ color: #0284c7; margin: 0 0 10px 0; }}
+            .details-section {{ display: flex; justify-content: space-between; margin-bottom: 30px; font-size: 14px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
+            th, td {{ border: 1px solid #e2e8f0; padding: 12px; font-size: 14px; }}
+            th {{ background-color: #f1f5f9; color: #0f172a; text-align: left; }}
+            .totals {{ width: 350px; margin-left: auto; }}
+            .totals td {{ padding: 8px 12px; }}
+            .status-badge {{ display: inline-block; padding: 6px 12px; border-radius: 6px; color: #fff; background-color: {status_color}; font-weight: bold; }}
+            .footer {{ margin-top: 50px; font-size: 12px; color: #64748b; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; }}
+        </style>
+    </head>
+    <body onload="window.print()">
+        <div class="container">
+            <div class="header">
+                <div class="company-info">
+                    <h2>Ihr ERP Unternehmen GmbH</h2>
+                    <p>Musterstraße 42<br>10115 Berlin, Deutschland<br>St.-Nr: 30/123/45678<br>USt-IdNr: DE987654321</p>
+                </div>
+                <div class="invoice-title">
+                    <h1>RECHNUNG</h1>
+                    <p><strong>Rechnungsnummer:</strong> {inv[4]}<br>
+                       <strong>Datum:</strong> {inv[5]}<br>
+                       <strong>Zahlungsart:</strong> {pay_method}</p>
+                </div>
+            </div>
+
+            <div class="details-section">
+                <div>
+                    <strong>Rechnungsempfänger (Käufer):</strong><br>
+                    <div style="margin-top: 5px; font-size: 15px;">
+                        <strong>{inv[1]}</strong><br>
+                        {inv[2]}<br>
+                        {('USt-IdNr: ' + inv[3]) if inv[3] else ''}
+                    </div>
+                </div>
+                <div>
+                    <strong>Status:</strong><br>
+                    <div style="margin-top: 5px;">
+                        <span class="status-badge">{status_text}</span>
+                    </div>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Artikelbezeichnung</th>
+                        <th style="text-align:center;">Menge / Gewicht</th>
+                        <th style="text-align:right;">Einzelpreis (Netto)</th>
+                        <th style="text-align:right;">Gesamt (Netto)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {items_html}
+                </tbody>
+            </table>
+
+            <table class="totals">
+                <tr>
+                    <td><strong>Nettobetrag:</strong></td>
+                    <td style="text-align:right;">{inv[6]:.2f} €</td>
+                </tr>
+                <tr>
+                    <td><strong>Umsatzsteuer ({vat_percent}%):</strong></td>
+                    <td style="text-align:right;">{inv[8]:.2f} €</td>
+                </tr>
+                <tr style="border-top: 2px solid #0f172a; font-size: 16px;">
+                    <td><strong>Gesamtbetrag (Brutto):</strong></td>
+                    <td style="text-align:right;"><strong>{inv[9]:.2f} €</strong></td>
+                </tr>
+            </table>
+
+            <div class="footer">
+                <p>Vielen Dank für Ihren Geschäftsauftrag! Gemäß § 14 UStG ist diese Rechnung ohne Unterschrift gültig.</p>
+                <p>Bankverbindung: Musterbank Berlin | IBAN: DE89 3704 0044 0532 0130 00 | BIC: GENODEM1XXX</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.get("/journal-entries/")
 def get_journal_entries():
