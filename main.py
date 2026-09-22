@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 conn = sqlite3.connect('accounting.db', check_same_thread=False)
 c = conn.cursor()
 
-# إنشاء الجداول الأساسية
+# إنشاء جداول النظام الأساسية
 c.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,6 +30,46 @@ c.execute('''
 c.execute("SELECT COUNT(*) FROM suppliers")
 if c.fetchone()[0] == 0:
     c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", ("General / عام", "Germany", "DE000000000"))
+    conn.commit()
+
+# جدول بيانات الشركة لتعديلها يدوياً
+c.execute('''
+    CREATE TABLE IF NOT EXISTS company_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT,
+        address TEXT,
+        phone TEXT,
+        email TEXT,
+        website TEXT,
+        iban TEXT,
+        bic TEXT,
+        ust_id TEXT,
+        hrb TEXT,
+        amtsgericht TEXT,
+        director TEXT,
+        payment_terms TEXT
+    )
+''')
+
+c.execute("SELECT COUNT(*) FROM company_settings")
+if c.fetchone()[0] == 0:
+    c.execute('''
+        INSERT INTO company_settings (company_name, address, phone, email, website, iban, bic, ust_id, hrb, amtsgericht, director, payment_terms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        "Darnieto GmbH",
+        "Terofalstr. 69, 80689 München",
+        "+49 171 3277770",
+        "N.zehrawi@web.de",
+        "www.darnieto.com",
+        "DE68 7009 1500 0000 3545 03",
+        "GENODEF1DCA",
+        "DE 356285202",
+        "HRB 279740",
+        "München",
+        "Nazira Zehrawi",
+        "Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto."
+    ))
     conn.commit()
 
 c.execute('''
@@ -119,6 +159,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class CompanySettingsUpdate(BaseModel):
+    company_name: str
+    address: str
+    phone: str
+    email: str
+    website: str
+    iban: str
+    bic: str
+    ust_id: str
+    hrb: str
+    amtsgericht: str
+    director: str
+    payment_terms: str
+
 class AccountCreate(BaseModel):
     account_number: str
     account_name: str
@@ -175,6 +229,31 @@ class InventoryItemUpdate(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "ERP Accounting Backend is running successfully!"}
+
+@app.get("/company/")
+def get_company_settings():
+    c.execute("SELECT company_name, address, phone, email, website, iban, bic, ust_id, hrb, amtsgericht, director, payment_terms FROM company_settings WHERE id=1")
+    row = c.fetchone()
+    if not row:
+        return {}
+    return {
+        "company_name": row[0], "address": row[1], "phone": row[2], "email": row[3],
+        "website": row[4], "iban": row[5], "bic": row[6], "ust_id": row[7],
+        "hrb": row[8], "amtsgericht": row[9], "director": row[10], "payment_terms": row[11]
+    }
+
+@app.put("/company/")
+def update_company_settings(data: CompanySettingsUpdate):
+    c.execute("""
+        UPDATE company_settings 
+        setItem company_name=?, address=?, phone=?, email=?, website=?, iban=?, bic=?, ust_id=?, hrb=?, amtsgericht=?, director=?, payment_terms=?
+        WHERE id=1
+    """, (
+        data.company_name, data.address, data.phone, data.email, data.website,
+        data.iban, data.bic, data.ust_id, data.hrb, data.amtsgericht, data.director, data.payment_terms
+    ))
+    conn.commit()
+    return {"message": "Company settings updated successfully"}
 
 @app.get("/accounts/")
 def get_accounts():
@@ -286,7 +365,6 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (invoice_id, p["id"], p["name"], p["quantity"], p["unit_price"], p["net_total"]))
         
-        # خصم الكمية فقط دون حذف الصنف نهائياً من الجدول
         new_qty = c.execute("SELECT quantity FROM inventory WHERE id=?", (p["id"],)).fetchone()[0] - p["quantity"]
         c.execute("UPDATE inventory SET quantity=? WHERE id=?", (new_qty, p["id"]))
     
@@ -300,6 +378,21 @@ def print_invoice_html(invoice_id: int):
     if not inv:
         return "<h1>Invoice not found</h1>", 404
     
+    c.execute("SELECT company_name, address, phone, email, website, iban, bic, ust_id, hrb, amtsgericht, director, payment_terms FROM company_settings WHERE id=1")
+    comp = c.fetchone()
+    comp_name = comp[0] if comp else "Darnieto GmbH"
+    comp_addr = comp[1] if comp else "Terofalstr. 69, 80689 München"
+    comp_phone = comp[2] if comp else ""
+    comp_email = comp[3] if comp else ""
+    comp_web = comp[4] if comp else ""
+    comp_iban = comp[5] if comp else ""
+    comp_bic = comp[6] if comp else ""
+    comp_ust = comp[7] if comp else ""
+    comp_hrb = comp[8] if comp else ""
+    comp_amts = comp[9] if comp else ""
+    comp_dir = comp[10] if comp else ""
+    comp_terms = comp[11] if comp else "Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto."
+
     c.execute("SELECT item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
     items = c.fetchall()
     
@@ -339,7 +432,7 @@ def print_invoice_html(invoice_id: int):
         <div class="container">
             <div class="top-header">
                 <div>
-                    <div class="logo-area">Darnieto</div>
+                    <div class="logo-area">{comp_name}</div>
                 </div>
                 <div class="invoice-meta">
                     <h2 style="margin: 0 0 10px 0; font-size: 22px;">Rechnung</h2>
@@ -352,7 +445,7 @@ def print_invoice_html(invoice_id: int):
                 </div>
             </div>
 
-            <div class="sender-line">Darnieto GmbH, Terofalstr. 69, 80689 München</div>
+            <div class="sender-line">{comp_name}, {comp_addr}</div>
 
             <div class="addresses">
                 <div>
@@ -360,9 +453,8 @@ def print_invoice_html(invoice_id: int):
                     {inv[2]}
                 </div>
                 <div style="text-align: right; font-size: 12px;">
-                    Darnieto GmbH<br>
-                    Terofalstr. 69<br>
-                    80689 München
+                    {comp_name}<br>
+                    {comp_addr.replace(', ', '<br>')}
                 </div>
             </div>
 
@@ -407,7 +499,7 @@ def print_invoice_html(invoice_id: int):
 
             <div class="payment-terms">
                 Zahlungsart: {pay_method}<br>
-                Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen ab Rechnungsdatum auf unser unten genanntes Konto.<br><br>
+                {comp_terms}<br><br>
                 Nach Ablauf dieser Frist gerät der Kunde ohne weitere Mahnung in Verzug.<br>
                 Es werden gesetzliche Verzugszinsen sowie Mahngebühren erhoben.<br>
                 Für weitere Fragen stehen wir Ihnen gerne zur Verfügung.
@@ -425,27 +517,24 @@ def print_invoice_html(invoice_id: int):
 
             <div class="footer">
                 <div>
-                    Darnieto GmbH<br>
-                    Terofalstr. 69<br>
-                    80689 München<br>
-                    🌐 www.darnieto.com
+                    {comp_name}<br>
+                    {comp_addr.replace(', ', '<br>')}<br>
+                    🌐 {comp_web}
                 </div>
                 <div>
-                    📞 +49 171 3277770<br>
-                    📠 +49 171 3277771<br>
-                    ✉️ N.zehrawi@web.de
+                    📞 {comp_phone}<br>
+                    ✉️ {comp_email}
                 </div>
                 <div>
                     Bankverbindung:<br>
-                    Volksbank Raiffeisenbank eG Dachau<br>
-                    IBAN: DE68 7009 1500 0000 3545 03<br>
-                    BIC: GENODEF1DCA
+                    IBAN: {comp_iban}<br>
+                    BIC: {comp_bic}
                 </div>
                 <div>
-                    UST.-ID: DE 356285202<br>
-                    HRB 279740<br>
-                    Amtsgericht: München<br>
-                    Geschäftsführer: Nazira Zehrawi
+                    UST.-ID: {comp_ust}<br>
+                    {comp_hrb}<br>
+                    Amtsgericht: {comp_amts}<br>
+                    Geschäftsführer: {comp_dir}
                 </div>
             </div>
         </div>
