@@ -7,7 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 conn = sqlite3.connect('accounting.db', check_same_thread=False)
 c = conn.cursor()
 
-# إنشاء الجداول الأساسية
+# إنشاء جداول النظام الأساسية
+c.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        identifier TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        name TEXT
+    )
+''')
+
 c.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +41,6 @@ if c.fetchone()[0] == 0:
     c.execute("INSERT INTO suppliers (name, address, ust_id) VALUES (?, ?, ?)", ("General / عام", "Germany", "DE000000000"))
     conn.commit()
 
-# جدول إعدادات الشركة (فارغ كلياً بالبداية للإدخال اليدوي)
 c.execute('''
     CREATE TABLE IF NOT EXISTS company_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +154,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class UserRegister(BaseModel):
+    identifier: str
+    password: str
+    name: str = ""
+
+class UserLogin(BaseModel):
+    identifier: str
+    password: str
+
 class CompanySettingsUpdate(BaseModel):
     company_name: str
     address: str
@@ -216,6 +233,23 @@ class InventoryItemUpdate(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "ERP Accounting Backend is running successfully!"}
+
+@app.post("/auth/register")
+def register_user(data: UserRegister):
+    try:
+        c.execute("INSERT INTO users (identifier, password, name) VALUES (?, ?, ?)", (data.identifier, data.password, data.name))
+        conn.commit()
+        return {"message": "User registered successfully"}
+    except sqlite3.IntegrityError:
+        return {"error": "User with this email or mobile already exists"}
+
+@app.post("/auth/login")
+def login_user(data: UserLogin):
+    c.execute("SELECT id, name, identifier FROM users WHERE identifier=? AND password=?", (data.identifier, data.password))
+    row = c.fetchone()
+    if not row:
+        return {"error": "Invalid email/mobile or password"}
+    return {"message": "Login successful", "user": {"id": row[0], "name": row[1], "identifier": row[2]}}
 
 @app.get("/company/")
 def get_company_settings():
