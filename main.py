@@ -1,13 +1,15 @@
 import sqlite3
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import os
 
 conn = sqlite3.connect('accounting.db', check_same_thread=False)
 c = conn.cursor()
 
-# إنشاء جداول النظام الأساسية
+# إنشاء الجداول الأساسية
 c.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +83,9 @@ c.execute('''
         vat_amount REAL NOT NULL,
         gross_amount REAL NOT NULL,
         status TEXT DEFAULT 'Unpaid',
-        payment_method TEXT DEFAULT 'Bank'
+        payment_method TEXT DEFAULT 'Bank',
+        is_storno INTEGER DEFAULT 0,
+        original_invoice_number TEXT DEFAULT ''
     )
 ''')
 
@@ -96,19 +100,6 @@ c.execute('''
         net_total REAL
     )
 ''')
-
-for col, col_type in [
-    ("buyer_name", "TEXT"),
-    ("buyer_address", "TEXT"),
-    ("buyer_ust_id", "TEXT"),
-    ("status", "TEXT DEFAULT 'Unpaid'"),
-    ("payment_method", "TEXT DEFAULT 'Bank'")
-]:
-    try:
-        c.execute(f"ALTER TABLE invoices ADD COLUMN {col} {col_type}")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
 
 c.execute('''
     CREATE TABLE IF NOT EXISTS journal_entries (
@@ -128,7 +119,8 @@ c.execute('''
         vendor TEXT NOT NULL,
         net_amount REAL NOT NULL,
         vat_amount REAL NOT NULL,
-        gross_amount REAL NOT NULL
+        gross_amount REAL NOT NULL,
+        image_path TEXT DEFAULT ''
     )
 ''')
 
@@ -143,6 +135,8 @@ c.execute('''
     )
 ''')
 conn.commit()
+
+os.makedirs("uploads", exist_ok=True)
 
 app = FastAPI()
 
@@ -210,12 +204,6 @@ class JournalEntryCreate(BaseModel):
     credit_account_id: int
     amount: float
 
-class ReceiptCreate(BaseModel):
-    date: str
-    vendor: str
-    net_amount: float
-    vat_rate: float = 0.19
-
 class InventoryItemCreate(BaseModel):
     supplier_id: int
     name: str
@@ -232,7 +220,7 @@ class InventoryItemUpdate(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "ERP Accounting Backend is running successfully!"}
+    return {"message": "ERP Accounting Backend with all features is running successfully!"}
 
 @app.post("/auth/register")
 def register_user(data: UserRegister):
@@ -288,13 +276,6 @@ def create_account(acc: AccountCreate):
     conn.commit()
     return {"message": "Account created successfully"}
 
-@app.put("/accounts/{account_id}")
-def update_account(account_id: int, acc: AccountCreate):
-    c.execute("UPDATE accounts SET account_number=?, account_name=?, account_type=?, balance=? WHERE id=?",
-              (acc.account_number, acc.account_name, acc.account_type, acc.balance, account_id))
-    conn.commit()
-    return {"message": "Account updated successfully"}
-
 @app.delete("/accounts/{account_id}")
 def delete_account(account_id: int):
     c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -315,7 +296,7 @@ def create_supplier(sup: SupplierCreate):
 
 @app.get("/invoices/")
 def get_invoices():
-    c.execute("SELECT id, supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method FROM invoices")
+    c.execute("SELECT id, supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method, is_storno, original_invoice_number FROM invoices")
     invoices = []
     for r in c.fetchall():
         inv_id = r[0]
@@ -324,7 +305,7 @@ def get_invoices():
         invoices.append({
             "id": inv_id, "supplier_id": r[1], "buyer_name": r[2], "buyer_address": r[3], "buyer_ust_id": r[4],
             "invoice_number": r[5], "date": r[6], "net_amount": r[7], "vat_rate": r[8], "vat_amount": r[9], 
-            "gross_amount": r[10], "status": r[11], "payment_method": r[12], "items": items
+            "gross_amount": r[10], "status": r[11], "payment_method": r[12], "is_storno": r[13], "original_invoice_number": r[14], "items": items
         })
     return invoices
 
@@ -374,8 +355,8 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     first_supplier_id = processed_items[0]["supplier_id"] if processed_items else 1
     
     c.execute("""
-        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method, is_storno, original_invoice_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')
     """, (first_supplier_id, data.buyer_name, data.buyer_address, data.buyer_ust_id, data.invoice_number, data.date, total_net, data.vat_rate, vat_amount, gross_amount, data.status, data.payment_method))
     
     invoice_id = c.lastrowid
@@ -392,9 +373,53 @@ def create_multi_item_invoice(data: MultiItemInvoiceCreate):
     conn.commit()
     return {"message": "Multi-item invoice created successfully and stock updated!"}
 
+# ميزة تصحيح / إلغاء الفاتورة (Storno / Rechnungskorrektur) (§ 14 UStG)
+@app.post("/invoices/{invoice_id}/storno")
+def create_storno_invoice(invoice_id: int):
+    c.execute("SELECT supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, payment_method FROM invoices WHERE id=?", (invoice_id,))
+    inv = c.fetchone()
+    if not inv:
+        return {"error": "Original invoice not found"}
+    
+    orig_num = inv[4]
+    storno_num = f"ST-{orig_num}"
+    
+    # التحقق من عدم وجود سטורنو سابق لنفس الفاتورة
+    c.execute("SELECT id FROM invoices WHERE invoice_number=?", (storno_num,))
+    if c.fetchone():
+        return {"error": "Storno invoice already exists for this number"}
+
+    net_amt = -inv[6]
+    vat_amt = -inv[8]
+    gross_amt = -inv[9]
+    
+    c.execute("""
+        INSERT INTO invoices (supplier_id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method, is_storno, original_invoice_number)
+        VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'), ?, ?, ?, ?, 'Cancelled', ?, 1, ?)
+    """, (inv[0], inv[1], inv[2], inv[3], storno_num, net_amt, inv[7], vat_amt, gross_amt, inv[10], orig_num))
+    
+    storno_id = c.lastrowid
+    
+    # جلب عناصر الفاتورة الأصلية وإرجاع الكميات للمخزن وعكس السجلات
+    c.execute("SELECT inventory_item_id, item_name, quantity, unit_price, net_total FROM invoice_items WHERE invoice_id=?", (invoice_id,))
+    items = c.fetchall()
+    for item in items:
+        inv_item_id, name, qty, price, net_tot = item
+        c.execute("""
+            INSERT INTO invoice_items (invoice_id, inventory_item_id, item_name, quantity, unit_price, net_total)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (storno_id, inv_item_id, name, qty, price, -net_tot))
+        
+        # إعادة الكمية للمخزن
+        if inv_item_id:
+            c.execute("UPDATE inventory SET quantity = quantity + ? WHERE id=?", (qty, inv_item_id))
+            
+    conn.commit()
+    return {"message": "Storno invoice created successfully and inventory restored!", "storno_invoice_number": storno_num}
+
 @app.get("/invoices/{invoice_id}/print-html", response_class=HTMLResponse)
 def print_invoice_html(invoice_id: int):
-    c.execute("SELECT id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method FROM invoices WHERE id=?", (invoice_id,))
+    c.execute("SELECT id, buyer_name, buyer_address, buyer_ust_id, invoice_number, date, net_amount, vat_rate, vat_amount, gross_amount, status, payment_method, is_storno, original_invoice_number FROM invoices WHERE id=?", (invoice_id,))
     inv = c.fetchone()
     if not inv:
         return "<h1>Invoice not found</h1>", 404
@@ -420,13 +445,15 @@ def print_invoice_html(invoice_id: int):
     items_html = "".join([f"<tr><td style='text-align:center;'>{idx+1}</td><td>{i[0]}</td><td style='text-align:center;'>{i[1]}</td><td style='text-align:center;'>Karton</td><td style='text-align:right;'>{i[2]:.2f} €</td><td style='text-align:right;'>{i[3]:.2f} €</td></tr>" for idx, i in enumerate(items)])
     vat_percent = int(inv[7] * 100)
     pay_method = "Überweisung" if inv[11] == "Bank" else "Barzahlung"
+    title_text = "Stornorechnung / Rechnungskorrektur" if inv[12] == 1 else "Rechnung"
+    storno_note = f"<p style='color: #dc2626; font-weight: bold;'>Dies ist eine Stornorechnung zur Rechnungsnummer: {inv[13]}</p>" if inv[12] == 1 else ""
 
     html_content = f"""
     <!DOCTYPE html>
     <html lang="de">
     <head>
         <meta charset="UTF-8">
-        <title>Rechnung Nr. {inv[4]}</title>
+        <title>{title_text} Nr. {inv[4]}</title>
         <style>
             body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 30px; color: #1e293b; background: #fff; font-size: 13px; }}
             .container {{ max-width: 800px; margin: auto; border: 1px solid #cbd5e1; padding: 40px; border-radius: 6px; position: relative; min-height: 1050px; box-sizing: border-box; }}
@@ -443,8 +470,6 @@ def print_invoice_html(invoice_id: int):
             .totals-table {{ width: 350px; margin-left: auto; border-collapse: collapse; margin-bottom: 30px; }}
             .totals-table td {{ border: 1px solid #94a3b8; padding: 6px 10px; }}
             .payment-terms {{ font-size: 12px; line-height: 1.5; margin-bottom: 30px; color: #334155; }}
-            .qr-section {{ display: flex; align-items: center; gap: 15px; margin-bottom: 40px; }}
-            .qr-box {{ border: 1px solid #cbd5e1; padding: 10px; width: 80px; height: 80px; text-align: center; font-size: 10px; background: #f8fafc; }}
             .footer {{ position: absolute; bottom: 30px; left: 40px; right: 40px; display: flex; justify-content: space-between; font-size: 10px; color: #475569; border-top: 1px solid #cbd5e1; padding-top: 15px; line-height: 1.4; }}
             .footer div {{ flex: 1; }}
         </style>
@@ -456,12 +481,11 @@ def print_invoice_html(invoice_id: int):
                     <div class="logo-area">{comp_name}</div>
                 </div>
                 <div class="invoice-meta">
-                    <h2 style="margin: 0 0 10px 0; font-size: 22px;">Rechnung</h2>
+                    <h2 style="margin: 0 0 10px 0; font-size: 22px;">{title_text}</h2>
+                    {storno_note}
                     <table>
-                        <tr><td>Rechnungsnr.:</td><td><strong>{inv[4]}</strong></td></tr>
-                        <tr><td>Kundennr.:</td><td>10168</td></tr>
+                        <tr><td>Nr.:</td><td><strong>{inv[4]}</strong></td></tr>
                         <tr><td>Datum:</td><td>{inv[5]}</td></tr>
-                        <tr><td>Lieferdatum:</td><td>{inv[5]}</td></tr>
                     </table>
                 </div>
             </div>
@@ -501,14 +525,6 @@ def print_invoice_html(invoice_id: int):
                     <td style="text-align: right;">{inv[6]:.2f} €</td>
                 </tr>
                 <tr>
-                    <td>abzgl. Rabatt</td>
-                    <td style="text-align: right;">0,00 €</td>
-                </tr>
-                <tr>
-                    <td><strong>Gesamt (netto)</strong></td>
-                    <td style="text-align: right;"><strong>{inv[6]:.2f} €</strong></td>
-                </tr>
-                <tr>
                     <td>Umsatzsteuer {vat_percent} %</td>
                     <td style="text-align: right;">{inv[8]:.2f} €</td>
                 </tr>
@@ -520,49 +536,29 @@ def print_invoice_html(invoice_id: int):
 
             <div class="payment-terms">
                 Zahlungsart: {pay_method}<br>
-                {comp_terms}<br><br>
-                Nach Ablauf dieser Frist gerät der Kunde ohne weitere Mahnung in Verzug.<br>
-                Es werden gesetzliche Verzugszinsen sowie Mahngebühren erhoben.<br>
-                Für weitere Fragen stehen wir Ihnen gerne zur Verfügung.
-            </div>
-
-            <div class="qr-section">
-                <div class="qr-box">
-                    [ QR Code ]
-                </div>
-                <div style="font-size: 11px;">
-                    <strong>Überweisen per Code</strong><br>
-                    Ganz bequem Code mit der<br>Banking-App scannen.
-                </div>
+                {comp_terms}
             </div>
 
             <div class="footer">
-                <div>
-                    {comp_name}<br>
-                    {comp_addr.replace(', ', '<br>')}<br>
-                    🌐 {comp_web}
-                </div>
-                <div>
-                    📞 {comp_phone}<br>
-                    ✉️ {comp_email}
-                </div>
-                <div>
-                    Bankverbindung:<br>
-                    IBAN: {comp_iban}<br>
-                    BIC: {comp_bic}
-                </div>
-                <div>
-                    UST.-ID: {comp_ust}<br>
-                    {comp_hrb}<br>
-                    Amtsgericht: {comp_amts}<br>
-                    Geschäftsführer: {comp_dir}
-                </div>
+                <div>{comp_name}<br>{comp_addr}</div>
+                <div>IBAN: {comp_iban}<br>BIC: {comp_bic}</div>
+                <div>UST.-ID: {comp_ust}<br>{comp_hrb}</div>
             </div>
         </div>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
+
+# تصدير بيانات الضرائب بصيغة DATEV / CSV
+@app.get("/export/datev", response_class=PlainTextResponse)
+def export_datev():
+    c.execute("SELECT invoice_number, date, net_amount, vat_amount, gross_amount, buyer_name FROM invoices")
+    rows = c.fetchall()
+    csv_data = "Rechnungsnummer;Datum;Netto;Umsatzsteuer;Brutto;Kunde\n"
+    for r in rows:
+        csv_data += f"{r[0]};{r[1]};{r[2]:.2f};{r[3]:.2f};{r[4]:.2f};{r[5]}\n"
+    return csv_data
 
 @app.get("/journal-entries/")
 def get_journal_entries():
@@ -578,17 +574,21 @@ def create_journal_entry(entry: JournalEntryCreate):
 
 @app.get("/receipts/")
 def get_receipts():
-    c.execute("SELECT id, date, vendor, net_amount, vat_amount, gross_amount FROM receipts")
-    return [{"id": r[0], "date": r[1], "vendor": r[2], "net_amount": r[3], "vat_amount": r[4], "gross_amount": r[5]} for r in c.fetchall()]
+    c.execute("SELECT id, date, vendor, net_amount, vat_amount, gross_amount, image_path FROM receipts")
+    return [{"id": r[0], "date": r[1], "vendor": r[2], "net_amount": r[3], "vat_amount": r[4], "gross_amount": r[5], "image_path": r[6]} for r in c.fetchall()]
 
-@app.post("/receipts/")
-def create_receipt(receipt: ReceiptCreate):
-    vat_amount = receipt.net_amount * receipt.vat_rate
-    gross_amount = receipt.net_amount + vat_amount
-    c.execute("INSERT INTO receipts (date, vendor, net_amount, vat_amount, gross_amount) VALUES (?, ?, ?, ?, ?)",
-              (receipt.date, receipt.vendor, receipt.net_amount, vat_amount, gross_amount))
+@app.post("/receipts/upload")
+async def upload_receipt(date: str, vendor: str, net_amount: float, file: UploadFile = File(...)):
+    file_path = f"uploads/{file.filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    vat_amount = net_amount * 0.19
+    gross_amount = net_amount + vat_amount
+    c.execute("INSERT INTO receipts (date, vendor, net_amount, vat_amount, gross_amount, image_path) VALUES (?, ?, ?, ?, ?, ?)",
+              (date, vendor, net_amount, vat_amount, gross_amount, file_path))
     conn.commit()
-    return {"message": "Receipt saved successfully"}
+    return {"message": "Receipt uploaded and saved successfully", "file_path": file_path}
 
 @app.get("/inventory/")
 def get_inventory():
